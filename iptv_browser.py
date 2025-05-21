@@ -132,6 +132,35 @@ class IPTVBrowser:
             logging.error(f"Unexpected error: {e}")
             raise
 
+    def parse_playlist_from_content(self, content: str) -> bool:
+        """Parse M3U playlist content from a string with error handling."""
+        try:
+            if not content.strip().startswith('#EXTM3U'):
+                raise PlaylistParsingError("Invalid M3U format: Missing #EXTM3U header")
+            
+            # Reset channels before parsing new content
+            self.channels = [] 
+            self.playlist_url = None # Reset playlist URL as we are loading from content
+
+            self._parse_playlist(content)
+            
+            if not self.channels:
+                # This case might be covered by _parse_playlist raising an error if content is bad
+                # but an explicit check if no channels were parsed can be useful.
+                # However, _parse_playlist already handles logging, so maybe just check len.
+                logging.info("Playlist parsed, but no channels were loaded.")
+            
+            return True # Success if parsing completed, even if no channels found (empty valid playlist)
+
+        except PlaylistParsingError as e: # Catch specific error from _parse_playlist or header check
+            logging.error(f"Content parsing error: {e}")
+            raise # Re-raise for the GUI to handle
+        except Exception as e: # Catch any other unexpected errors during parsing
+            logging.error(f"Unexpected error during content parsing: {e}")
+            # Encapsulate unexpected errors into PlaylistParsingError for consistent error handling by caller
+            raise PlaylistParsingError(f"Unexpected error processing playlist content: {e}")
+
+
     def _parse_playlist(self, content: str):
         """Parse playlist content with error handling"""
         try:
