@@ -1,6 +1,6 @@
 import requests
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import json
@@ -27,6 +27,14 @@ logging.basicConfig(
 
 
 @dataclass
+class Episode:
+    name: str
+    url: str
+    season_number: Optional[int] = None
+    episode_number: Optional[int] = None
+
+
+@dataclass
 class IPTVChannel:
     name: str
     group: str
@@ -35,7 +43,8 @@ class IPTVChannel:
     epg_id: Optional[str] = None
     country: Optional[str] = None
     language: Optional[str] = None
-    category: Optional[str] = None
+    category: Optional[str] = None  # Added category
+    episodes: List[Episode] = field(default_factory=list)  # Added episodes field
 
 
 class URLValidationError(Exception):
@@ -134,46 +143,137 @@ class IPTVBrowser:
                 'country': re.compile(r'tvg-country="([^"]*)"'),
                 'language': re.compile(r'tvg-language="([^"]*)"')
             }
+            # Regex to find SxxExx pattern and extract season/episode numbers
+            series_episode_meta_regex = re.compile(r'[Ss](\d+)[Ee](\d+)')
+            # Regex to extract the series name part from a string like "Series Name S01E01"
+            series_name_regex = re.compile(r'^(.*?)\s*[Ss]\d+[Ee]\d+', re.IGNORECASE)
+
 
             self.channels = []
+            series_channels_map: Dict[str, IPTVChannel] = {} # To group episodes under a single series entry
+            
             buffer = io.StringIO(content)
             buffer.readline()  # Skip #EXTM3U line
 
             extinf_line = None
             line_number = 1
 
-            for line in buffer:
+            for line_content in buffer:
                 line_number += 1
-                line = line.strip()
-                if not line:
+                line_content = line_content.strip()
+                if not line_content:
                     continue
 
-                if line.startswith('#EXTINF:'):
-                    extinf_line = line
-                elif extinf_line and not line.startswith('#'):
+                if line_content.startswith('#EXTINF:'):
+                    extinf_line = line_content
+                elif extinf_line and not line_content.startswith('#'):
+                    # This is the URL line
+                    channel_url = line_content
                     try:
-                        name = patterns['name'].search(extinf_line)
-                        name = name.group(1) if name else extinf_line.split(',')[-1].strip()
+                        # Extract common attributes
+                        raw_name = extinf_line.split(',')[-1].strip()
+                        tvg_name_match = patterns['name'].search(extinf_line)
+                        name = tvg_name_match.group(1) if tvg_name_match else raw_name
 
-                        channel = IPTVChannel(
-                            name=name,
-                            group=patterns['group'].search(extinf_line).group(1) if patterns['group'].search(
-                                extinf_line) else "Ungrouped",
-                            url=line,
-                            logo=patterns['logo'].search(extinf_line).group(1) if patterns['logo'].search(
-                                extinf_line) else None,
-                            epg_id=patterns['epg_id'].search(extinf_line).group(1) if patterns['epg_id'].search(
-                                extinf_line) else None,
-                            country=patterns['country'].search(extinf_line).group(1) if patterns['country'].search(
-                                extinf_line) else None,
-                            language=patterns['language'].search(extinf_line).group(1) if patterns['language'].search(
-                                extinf_line) else None
-                        )
-                        self.channels.append(channel)
+                        group_match = patterns['group'].search(extinf_line)
+                        group_title = group_match.group(1) if group_match else "Ungrouped"
+                        
+                        logo_match = patterns['logo'].search(extinf_line)
+                        logo = logo_match.group(1) if logo_match else None
+                        
+                        epg_id_match = patterns['epg_id'].search(extinf_line)
+                        epg_id = epg_id_match.group(1) if epg_id_match else None
+
+                        country_match = patterns['country'].search(extinf_line)
+                        country = country_match.group(1) if country_match else None
+
+                        language_match = patterns['language'].search(extinf_line)
+                        language = language_match.group(1) if language_match else None
+                        
+                        category = "Live Stream" # Default category
+
+                        # Categorization Logic
+                        if "series" in group_title.lower():
+                            category = "Series"
+                            
+                            # Try to extract season and episode numbers
+                            episode_meta_match = series_episode_meta_regex.search(name)
+                            
+                            if episode_meta_match:
+                                season_number = int(episode_meta_match.group(1))
+                                episode_number = int(episode_meta_match.group(2))
+                                episode_name = name # Use full original name for the episode
+                                
+                                # Try to extract series name using the specific regex
+                                series_name_match = series_name_regex.match(name)
+                                if series_name_match and series_name_match.group(1).strip():
+                                    series_name = series_name_match.group(1).strip()
+                                else:
+                                    # Fallback if series name part is empty or regex doesn't match structure
+                                    series_name = group_title 
+
+                                if series_name not in series_channels_map:
+                                    # Create the parent series channel if it doesn't exist
+                                    series_channels_map[series_name] = IPTVChannel(
+                                        name=series_name,
+                                        group=group_title,
+                                        url=None, # Series itself might not have a direct URL
+                                        logo=logo, # Use logo from the first encountered episode for the series
+                                        epg_id=epg_id, # Use EPG ID from the first encountered episode
+                                        country=country,
+                                        language=language,
+                                        category=category
+                                    )
+                                
+                                # Create and add the episode
+                                episode = Episode(
+                                    name=episode_name,
+                                    url=channel_url,
+                                    season_number=season_number,
+                                    episode_number=episode_number
+                                )
+                                series_channels_map[series_name].episodes.append(episode)
+                            else:
+                                # It's in a series group but name doesn't match SxxExx pattern,
+                                # treat as a regular channel under "Series" category for now.
+                                # Or, could decide to log this as unparsable episode.
+                                regular_series_channel = IPTVChannel(
+                                    name=name, group=group_title, url=channel_url, logo=logo,
+                                    epg_id=epg_id, country=country, language=language, category=category
+                                )
+                                self.channels.append(regular_series_channel)
+                        
+                        elif "movie" in group_title.lower():
+                            category = "Movie"
+                            channel = IPTVChannel(
+                                name=name, group=group_title, url=channel_url, logo=logo,
+                                epg_id=epg_id, country=country, language=language, category=category
+                            )
+                            self.channels.append(channel)
+
+                        elif "sport" in group_title.lower():
+                            category = "Sport"
+                            channel = IPTVChannel(
+                                name=name, group=group_title, url=channel_url, logo=logo,
+                                epg_id=epg_id, country=country, language=language, category=category
+                            )
+                            self.channels.append(channel)
+                        
+                        else: # Default to Live Stream or use group_title if specific keywords not found
+                            category = group_title if group_title != "Ungrouped" else "Live Stream"
+                            channel = IPTVChannel(
+                                name=name, group=group_title, url=channel_url, logo=logo,
+                                epg_id=epg_id, country=country, language=language, category=category
+                            )
+                            self.channels.append(channel)
+
                     except Exception as e:
-                        logging.warning(f"Error parsing channel at line {line_number}: {e}")
+                        logging.warning(f"Error parsing channel at line {line_number}: {e}. EXTINF: '{extinf_line}', URL: '{channel_url}'")
                     finally:
                         extinf_line = None
+            
+            # Add all collected series (with their episodes) to the main channels list
+            self.channels.extend(series_channels_map.values())
 
         except Exception as e:
             logging.error(f"Playlist parsing error: {e}")
@@ -221,39 +321,47 @@ class IPTVBrowser:
             raise
 
     def display_channels(self, channels: List[IPTVChannel]):
-        """Display channels with error handling"""
+        """Display channels or series with error handling"""
         try:
             table = Table(show_header=True, header_style="bold magenta")
             table.add_column("#", style="dim")
             table.add_column("Name")
-            table.add_column("Group")
+            table.add_column("Category", justify="left")
+            table.add_column("Details", justify="left")
             table.add_column("Language", justify="right")
 
-            for idx, channel in enumerate(channels, 1):
+            for idx, item in enumerate(channels, 1):
                 try:
+                    details = ""
+                    if item.category == "Series":
+                        details = f"{len(item.episodes)} episodes"
+                    elif item.url: # For Movies, Sports, Live Streams
+                        details = "Playable"
+                    
                     table.add_row(
                         str(idx),
-                        channel.name,
-                        channel.group or "N/A",
-                        channel.language or "N/A"
+                        item.name,
+                        item.category or "N/A",
+                        details,
+                        item.language or "N/A"
                     )
                 except Exception as e:
-                    logging.warning(f"Error displaying channel {channel.name}: {e}")
+                    logging.warning(f"Error displaying item {item.name}: {e}")
                     continue
 
             self.console.print(table)
 
         except Exception as e:
             logging.error(f"Display error: {e}")
-            self.console.print("[red]Error displaying channels[/red]")
+            self.console.print("[red]Error displaying items[/red]")
 
     def group_channels(self) -> Dict[str, List[IPTVChannel]]:
-        """Group channels with error handling"""
+        """Group channels by category with error handling"""
         try:
-            groups = defaultdict(list)
+            categories = defaultdict(list)
             for channel in self.channels:
-                groups[channel.group or "Ungrouped"].append(channel)
-            return dict(groups)
+                categories[channel.category or "Uncategorized"].append(channel)
+            return dict(categories)
         except Exception as e:
             logging.error(f"Grouping error: {e}")
             return {"Error": []}
@@ -266,7 +374,7 @@ class IPTVBrowser:
                 self.console.print(Panel.fit(
                     "IPTV Browser\n\n"
                     "[1] View All Channels\n"
-                    "[2] Browse by Group\n"
+                    "[2] Browse by Category\n"
                     "[3] Search Channels\n"
                     "[4] Exit",
                     title="Main Menu"
@@ -277,7 +385,7 @@ class IPTVBrowser:
                 if choice == "1":
                     self.browse_channels(self.channels)
                 elif choice == "2":
-                    self.browse_groups()
+                    self.browse_categories()
                 elif choice == "3":
                     self.search_menu()
                 elif choice == "4":
@@ -291,13 +399,67 @@ class IPTVBrowser:
                 self.console.print("[red]An error occurred. Please try again.[/red]")
                 input("Press Enter to continue...")
 
-    def browse_channels(self, channels: List[IPTVChannel]):
-        """Browse channels with error handling"""
+    def display_episodes(self, series_channel: IPTVChannel):
+        """Display episodes of a series and allow selection for playback."""
+        if not series_channel.episodes:
+            self.console.print("[yellow]No episodes found for this series.[/yellow]")
+            input("Press Enter to continue...")
+            return
+
         while True:
             try:
                 self.console.clear()
-                self.display_channels(channels)
-                choice = Prompt.ask("\nEnter channel number to play, 'b' for back", default="b")
+                self.console.print(Panel(f"Episodes for: {series_channel.name}", title="Episode List"))
+                
+                table = Table(show_header=True, header_style="bold cyan")
+                table.add_column("#", style="dim")
+                table.add_column("Episode Name")
+                table.add_column("Season", justify="right")
+                table.add_column("Episode", justify="right")
+
+                for idx, episode in enumerate(series_channel.episodes, 1):
+                    table.add_row(
+                        str(idx),
+                        episode.name,
+                        str(episode.season_number) if episode.season_number is not None else "N/A",
+                        str(episode.episode_number) if episode.episode_number is not None else "N/A"
+                    )
+                self.console.print(table)
+                
+                choice = Prompt.ask("\nEnter episode number to play, or 'b' for back", default="b")
+
+                if choice.lower() == 'b':
+                    break
+                
+                idx = int(choice) - 1
+                if 0 <= idx < len(series_channel.episodes):
+                    selected_episode = series_channel.episodes[idx]
+                    # Assuming play_channel can handle an object with a .url attribute
+                    self.play_channel(selected_episode) 
+                else:
+                    self.console.print("[red]Invalid episode number[/red]")
+                    input("Press Enter to continue...")
+
+            except ValueError:
+                self.console.print("[red]Invalid input. Please enter a number or 'b'.[/red]")
+                input("Press Enter to continue...")
+            except VLCNotFoundError: # Already handled in play_channel, but good to be explicit
+                self.console.print("[red]Error: VLC media player not found[/red]")
+                input("Press Enter to continue...")
+                break # Break from episode display on VLC error
+            except Exception as e:
+                logging.error(f"Episode display/playback error: {e}")
+                self.console.print("[red]An error occurred during episode selection or playback.[/red]")
+                input("Press Enter to continue...")
+
+
+    def browse_channels(self, channels: List[IPTVChannel]):
+        """Browse channels and series with error handling"""
+        while True:
+            try:
+                self.console.clear()
+                self.display_channels(channels) # This now shows category and episode count for series
+                choice = Prompt.ask("\nEnter item number to play or view episodes, 'b' for back", default="b")
 
                 if choice.lower() == 'b':
                     break
@@ -305,15 +467,22 @@ class IPTVBrowser:
                 try:
                     idx = int(choice) - 1
                     if 0 <= idx < len(channels):
-                        self.play_channel(channels[idx])
+                        selected_item = channels[idx]
+                        if selected_item.category == "Series" and selected_item.episodes:
+                            self.display_episodes(selected_item)
+                        elif selected_item.url: # Playable item (Movie, Sport, Live Stream, or Series fallback)
+                            self.play_channel(selected_item)
+                        else:
+                            self.console.print("[yellow]This item is not directly playable and has no episodes listed.[/yellow]")
+                            input("Press Enter to continue...")
                     else:
-                        self.console.print("[red]Invalid channel number[/red]")
+                        self.console.print("[red]Invalid item number[/red]")
                 except ValueError:
                     self.console.print("[red]Invalid input[/red]")
 
             except KeyboardInterrupt:
                 break
-            except VLCNotFoundError:
+            except VLCNotFoundError: # This might be redundant if play_channel handles it and re-raises
                 self.console.print("[red]Error: VLC media player not found[/red]")
                 input("Press Enter to continue...")
             except Exception as e:
@@ -321,30 +490,40 @@ class IPTVBrowser:
                 self.console.print("[red]An error occurred. Please try again.[/red]")
                 input("Press Enter to continue...")
 
-    def browse_groups(self):
-        """Browse groups with error handling"""
+    def browse_categories(self):
+        """Browse channels grouped by category with error handling"""
         try:
-            groups = self.group_channels()
+            categories = self.group_channels() # This now returns Dict[str, List[IPTVChannel]] by category
+            if not categories or "Error" in categories:
+                self.console.print("[yellow]No categories found or error in grouping.[/yellow]")
+                input("Press Enter to continue...")
+                return
+
             while True:
                 self.console.clear()
-                for idx, group in enumerate(groups.keys(), 1):
-                    self.console.print(f"[{idx}] {group} ({len(groups[group])} channels)")
+                self.console.print(Panel("Browse by Category", title="Categories"))
+                category_names = list(categories.keys())
+                for idx, name in enumerate(category_names, 1):
+                    self.console.print(f"[{idx}] {name} ({len(categories[name])} items)")
 
-                choice = Prompt.ask("\nSelect group number, 'b' for back", default="b")
+                choice = Prompt.ask("\nSelect category number, 'b' for back", default="b")
 
                 if choice.lower() == 'b':
                     break
 
                 try:
                     idx = int(choice) - 1
-                    group_name = list(groups.keys())[idx]
-                    self.browse_channels(groups[group_name])
+                    if 0 <= idx < len(category_names):
+                        selected_category_name = category_names[idx]
+                        self.browse_channels(categories[selected_category_name])
+                    else:
+                        self.console.print("[red]Invalid category number[/red]")
                 except (ValueError, IndexError):
-                    self.console.print("[red]Invalid group number[/red]")
+                    self.console.print("[red]Invalid input. Please enter a number or 'b'.[/red]")
 
         except Exception as e:
-            logging.error(f"Group browse error: {e}")
-            self.console.print("[red]An error occurred while browsing groups[/red]")
+            logging.error(f"Category browse error: {e}")
+            self.console.print("[red]An error occurred while browsing categories[/red]")
             input("Press Enter to continue...")
 
     def search_menu(self):
